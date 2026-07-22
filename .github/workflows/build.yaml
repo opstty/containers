@@ -1,0 +1,91 @@
+name: Build and Push Container Images
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'opstty/**'
+    tags:
+      - '*-[0-9]*'
+  workflow_dispatch:
+    inputs:
+      image:
+        description: 'Image to build (e.g. trino-register-table)'
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      images: ${{ steps.changes.outputs.images }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect changed images
+        id: changes
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "images=[\"${{ github.event.inputs.image }}\"]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # On tag push, extract the image name from the tag (e.g. trino-register-table-0.1.0 → trino-register-table)
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            # Strip the version suffix (-X.Y.Z or -X)
+            IMAGE_NAME=$(echo "$TAG" | sed 's/-[0-9][0-9.]*$//')
+            if [ -d "opstty/$IMAGE_NAME" ]; then
+              echo "images=[\"$IMAGE_NAME\"]" >> "$GITHUB_OUTPUT"
+            else
+              echo "images=[]" >> "$GITHUB_OUTPUT"
+            fi
+            exit 0
+          fi
+
+          CHANGED=$(git diff --name-only HEAD~1 HEAD -- opstty/ | cut -d'/' -f2 | sort -u | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "images=$CHANGED" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.images != '[]' && needs.detect-changes.outputs.images != ''
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        image: ${{ fromJson(needs.detect-changes.outputs.images) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version
+        id: version
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          if [[ "$TAG" == ${{ matrix.image }}-* ]]; then
+            VERSION="${TAG#${{ matrix.image }}-}"
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+            echo "has_version=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=latest" >> "$GITHUB_OUTPUT"
+            echo "has_version=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: opstty/${{ matrix.image }}
+          push: true
+          tags: |
+            ghcr.io/opstty/${{ matrix.image }}:latest
+            ${{ steps.version.outputs.has_version == 'true' && format('ghcr.io/opstty/{0}:{1}', matrix.image, steps.version.outputs.version) || '' }}

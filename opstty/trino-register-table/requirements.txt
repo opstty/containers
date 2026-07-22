@@ -1,0 +1,2 @@
+trino==0.337.0
+psycopg2-binary
